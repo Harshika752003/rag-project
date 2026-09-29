@@ -449,14 +449,18 @@ async function sendMessage() {
             state.chatHistory.push({ role: 'user', content: text });
             state.chatHistory.push({ role: 'model', content: data.reply });
         } else {
-            const data = await response.json();
+            let errorDetail = "Failed to generate reply.";
+            try {
+                const data = await response.json();
+                errorDetail = data.detail || errorDetail;
+            } catch (e) {}
             typingIndicator.classList.add('hidden');
-            appendMessage('assistant', `⚠️ **Error**: ${data.detail || "Failed to generate reply."}`);
+            appendMessage('assistant', `⚠️ **Error**: ${errorDetail}`);
         }
     } catch (error) {
         console.error("Error sending message:", error);
         typingIndicator.classList.add('hidden');
-        appendMessage('assistant', "⚠️ **Connection Error**: Failed to reach backend API.");
+        appendMessage('assistant', "⚠️ **Connection Error**: Failed to reach backend server. Please check your connection.");
     } finally {
         state.isGenerating = false;
         updateKeyIndicator();

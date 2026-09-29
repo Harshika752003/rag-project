@@ -10,6 +10,8 @@ from pypdf import PdfReader
 import numpy as np
 import chromadb
 from dotenv import load_dotenv
+import time
+import re
 import google.generativeai as genai
 
 # Setup logging
@@ -59,6 +61,110 @@ def split_text(text: str, chunk_size: int = 1000, chunk_overlap: int = 200) -> L
             
     return [c for c in chunks if c]
 
+# PDF Text Extraction with multi-engine fallback
+def extract_text_from_pdf(content: bytes, filename: str) -> str:
+    pages_text = []
+    
+    # 1. Try PyMuPDF (fitz) - high reliability C engine
+    try:
+        import fitz
+        doc = fitz.open(stream=content, filetype="pdf")
+        for page in doc:
+            t = page.get_text()
+            if t and t.strip():
+                pages_text.append(t.strip())
+        if pages_text:
+            logger.info(f"Extracted text from {filename} using PyMuPDF (fitz). Pages: {len(pages_text)}")
+            return "\n\n".join(pages_text)
+    except Exception as fe:
+        logger.warning(f"PyMuPDF text extraction failed for {filename}: {fe}")
+
+    # 2. Try PyPDF standard mode
+    try:
+        pdf_reader = PdfReader(io.BytesIO(content))
+        for i, page in enumerate(pdf_reader.pages):
+            try:
+                page_text = page.extract_text() or ""
+                if page_text.strip():
+                    pages_text.append(page_text.strip())
+            except Exception as pe:
+                logger.warning(f"Skipping page {i+1} in {filename} with pypdf: {pe}")
+        if pages_text:
+            logger.info(f"Extracted text from {filename} using pypdf.")
+            return "\n\n".join(pages_text)
+    except Exception as pe:
+        logger.warning(f"pypdf text extraction failed for {filename}: {pe}")
+
+    # 3. Try PyPDF layout mode
+    try:
+        pdf_reader = PdfReader(io.BytesIO(content))
+        for i, page in enumerate(pdf_reader.pages):
+            try:
+                page_text = page.extract_text(extraction_mode="layout") or ""
+                if page_text.strip():
+                    pages_text.append(page_text.strip())
+            except Exception:
+                pass
+        if pages_text:
+            logger.info(f"Extracted text from {filename} using pypdf layout mode.")
+            return "\n\n".join(pages_text)
+    except Exception:
+        pass
+
+    return ""
+
+# Gemini Multimodal OCR for scanned image PDFs
+def ocr_pdf_with_gemini(content: bytes, filename: str, api_key: str) -> str:
+    """Uses Gemini Multimodal Vision AI to OCR scanned PDF document pages."""
+    try:
+        import pymupdf
+        from PIL import Image
+        
+        logger.info(f"Attempting Gemini Vision OCR fallback for scanned PDF: {filename}")
+        genai.configure(api_key=api_key)
+        
+        # Try best available vision model candidates
+        model_candidates = [
+            "models/gemini-3.8-flash",
+            "models/gemini-3.6-flash",
+            "models/gemini-flash-latest"
+        ]
+        model = None
+        for candidate in model_candidates:
+            try:
+                model = genai.GenerativeModel(candidate)
+                break
+            except Exception:
+                continue
+        if not model:
+            model = genai.GenerativeModel("models/gemini-3.8-flash")
+        
+        doc = pymupdf.open(stream=content, filetype="pdf")
+        pages_text = []
+        
+        max_pages = min(len(doc), 30)
+        for i in range(max_pages):
+            page = doc[i]
+            pix = page.get_pixmap(dpi=150)
+            img_bytes = pix.tobytes("png")
+            img = Image.open(io.BytesIO(img_bytes))
+            
+            prompt = (
+                "Transcribe all text from this document page accurately. "
+                "Preserve all names, numbers, headings, bullet points, and table data. "
+                "Output only the extracted text without conversational preamble."
+            )
+            response = model.generate_content([prompt, img])
+            if response.text and response.text.strip():
+                pages_text.append(response.text.strip())
+                
+        if pages_text:
+            logger.info(f"Gemini Vision OCR successfully extracted text from {len(pages_text)} pages of {filename}")
+            return "\n\n".join(pages_text)
+    except Exception as e:
+        logger.error(f"Gemini Multimodal OCR failed for {filename}: {e}")
+    return ""
+
 # Vector Store Implementation
 class VectorStore:
     def __init__(self, persist_directory="chroma_db"):
@@ -97,6 +203,12 @@ class VectorStore:
             return docs
         except Exception as e:
             logger.error(f"Error retrieving documents list from ChromaDB: {e}")
+            if "mismatched types" in str(e).lower() or "decoding column" in str(e).lower():
+                logger.warning("Resetting corrupted/incompatible ChromaDB persistent store...")
+                try:
+                    self.clear()
+                except Exception:
+                    pass
             return {}
 
     def add_document(self, doc_name: str, texts: List[str], embeddings: List[List[float]]):
@@ -230,34 +342,36 @@ def generate_embeddings(texts: List[str], api_key: str, is_query: bool = False) 
                 batch_char_count += chunk_len
                 i += 1
                 
-            # Retry loop for rate limits (429 / ResourceExhausted)
-            max_retries = 5
-            base_delay = 2.0
-            for attempt in range(max_retries):
+            # Try candidate embedding models with retry
+            embedding_models = [
+                "models/gemini-embedding-001",
+                "models/text-embedding-004",
+                "models/embedding-001"
+            ]
+            batch_success = False
+            for emb_model in embedding_models:
                 try:
                     result = genai.embed_content(
-                        model="models/gemini-embedding-001",
+                        model=emb_model,
                         content=batch,
                         task_type=task_type
                     )
                     embeddings.extend(result['embedding'])
+                    batch_success = True
                     if not is_query and i < total_chunks:
                         time.sleep(0.3)
                     break
                 except Exception as e:
                     err_str = str(e).lower()
-                    is_rate_limit = "429" in err_str or "resourceexhausted" in err_str or "quota" in err_str
-                    if is_rate_limit and attempt < max_retries - 1:
-                        match = re.search(r"retry in (\d+\.?\d*)s", err_str)
-                        if match:
-                            sleep_time = float(match.group(1)) + 1.5
-                        else:
-                            sleep_time = base_delay * (2 ** attempt)
-                        
-                        logger.warning(f"Gemini API rate limit hit. Retrying embedding batch in {sleep_time:.2f}s... (Attempt {attempt+1}/{max_retries})")
-                        time.sleep(sleep_time)
+                    if "404" in err_str or "not found" in err_str:
+                        continue
+                    elif "429" in err_str or "resourceexhausted" in err_str or "quota" in err_str:
+                        logger.warning(f"Rate limit on {emb_model}. Trying next embedding candidate...")
+                        continue
                     else:
                         raise e
+            if not batch_success:
+                raise HTTPException(status_code=429, detail="Embedding rate limit hit across all embedding models. Please retry in a few seconds.")
         return embeddings
     except Exception as e:
         logger.error(f"Error generating embeddings: {e}")
@@ -315,15 +429,10 @@ async def upload_files(
         
         try:
             if filename.lower().endswith(".pdf"):
-                pdf_reader = PdfReader(io.BytesIO(content))
-                pages_text = []
-                for i, page in enumerate(pdf_reader.pages):
-                    try:
-                        page_text = page.extract_text() or ""
-                        pages_text.append(page_text)
-                    except Exception as pe:
-                        logger.warning(f"Skipping unreadable page {i+1} in {filename}: {pe}")
-                text = "\n\n".join(pages_text)
+                text = extract_text_from_pdf(content, filename)
+                if not text.strip() and api_key:
+                    logger.info(f"No digital text layer found in {filename}. Triggering Gemini Multimodal OCR...")
+                    text = ocr_pdf_with_gemini(content, filename, api_key)
             elif filename.lower().endswith((".txt", ".md")):
                 text = content.decode("utf-8", errors="replace")
             else:
@@ -331,6 +440,8 @@ async def upload_files(
                     status_code=400,
                     detail=f"Unsupported file format for {filename}. Please upload PDF, TXT or MD files."
                 )
+        except HTTPException:
+            raise
         except Exception as e:
             logger.error(f"Error parsing file {filename}: {e}")
             raise HTTPException(
@@ -395,38 +506,60 @@ def chat(
         f"--- CONTEXT ---\n{context_str}\n--- END CONTEXT ---"
     )
     
-    # 4. Invoke LLM with conversation history
-    try:
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel(
-            model_name="gemini-3.6-flash",
-            system_instruction=system_instruction
-        )
-        
-        # Convert history format to Google's expected format:
-        # History roles must alternate: user, model
-        chat_sessions_messages = []
-        for h in history:
-            role = "user" if h["role"] in ["user", "human"] else "model"
-            chat_sessions_messages.append({"role": role, "parts": [h["content"]]})
+    # 4. Invoke LLM with conversation history & multi-model fallback for free-tier rate limits
+    genai.configure(api_key=api_key)
+    model_candidates = [
+        "models/gemini-3.8-flash",
+        "models/gemini-3.5-flash",
+        "models/gemini-3.5-flash-lite",
+        "models/gemini-flash-latest",
+        "models/gemini-flash-lite-latest",
+        "models/gemini-3.6-flash"
+    ]
+    
+    last_exception = None
+    
+    for candidate in model_candidates:
+        try:
+            logger.info(f"Attempting chat generation with model: {candidate}")
+            model = genai.GenerativeModel(
+                model_name=candidate,
+                system_instruction=system_instruction
+            )
+            chat_sessions_messages = []
+            for h in history:
+                role = "user" if h["role"] in ["user", "human"] else "model"
+                chat_sessions_messages.append({"role": role, "parts": [h["content"]]})
+                
+            chat_session = model.start_chat(history=chat_sessions_messages)
+            response = chat_session.send_message(message)
             
-        chat = model.start_chat(history=chat_sessions_messages)
-        response = chat.send_message(message)
-        
-        return {
-            "reply": response.text,
-            "sources": [
-                {
-                    "doc_name": m["doc_name"],
-                    "text": m["text"],
-                    "score": m["score"]
-                }
-                for m in top_matches
-            ]
-        }
-    except Exception as e:
-        logger.error(f"Error invoking Gemini Model: {e}")
-        raise HTTPException(status_code=500, detail=f"Gemini Chat Generation Error: {str(e)}")
+            return {
+                "reply": response.text,
+                "sources": [
+                    {
+                        "doc_name": m["doc_name"],
+                        "text": m["text"],
+                        "score": m["score"]
+                    }
+                    for m in top_matches
+                ]
+            }
+        except Exception as e:
+            err_str = str(e).lower()
+            if "429" in err_str or "resourceexhausted" in err_str or "quota" in err_str or "404" in err_str or "not found" in err_str:
+                logger.warning(f"Model {candidate} hit rate limit ({e}). Instantly switching to next candidate model...")
+                last_exception = e
+                continue
+            else:
+                logger.error(f"Error invoking Gemini Model ({candidate}): {e}")
+                raise HTTPException(status_code=500, detail=f"Gemini Chat Generation Error: {str(e)}")
+
+    logger.error(f"All model candidates exhausted: {last_exception}")
+    raise HTTPException(
+        status_code=429,
+        detail="Gemini API rate limit reached across all models. Please wait 15 seconds and try asking again."
+    )
 
 # Mount static files
 static_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
